@@ -26,7 +26,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
 
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
-sys.stdout.reconfigure(line_buffering=True)
+# Also set UTF-8 encoding for Windows console compatibility
+try:
+    sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
+except (AttributeError, ValueError):
+    # Fallback for older Python versions or if encoding fails
+    sys.stdout.reconfigure(line_buffering=True)
+    if sys.platform == 'win32':
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # Optional: Trade Journal integration
 try:
@@ -318,16 +326,49 @@ def find_best_fast_market(markets):
 # CEX Price Signal
 # =============================================================================
 
-def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
+def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5, retries=3):
     """Get price momentum from Binance public API.
     Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
     """
+    import time
     url = (
         f"https://api.binance.com/api/v3/klines"
         f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
     )
-    result = _api_request(url)
-    if not result or isinstance(result, dict):
+    
+    result = None
+    for attempt in range(retries):
+        result = _api_request(url)
+        
+        # Check for error dict (from _api_request error handling)
+        if isinstance(result, dict) and result.get("error"):
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                time.sleep(wait_time)
+                continue
+            return None
+        
+        # Check if result is None or empty
+        if not result:
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            return None
+        
+        # Binance returns a list of candles, so if we got here and it's not a list, something's wrong
+        if not isinstance(result, list):
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            return None
+        
+        # Success - break out of retry loop
+        break
+    
+    # If we exhausted retries, result might be None or invalid
+    if not result or not isinstance(result, list):
         return None
 
     try:
@@ -493,7 +534,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     def log(msg, force=False):
         """Print unless quiet mode is on. force=True always prints."""
         if not quiet or force:
-            print(msg)
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                # Fallback: replace problematic characters
+                safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
+                print(safe_msg)
 
     log("⚡ Simmer FastLoop Trading Skill")
     log("=" * 50)
